@@ -349,78 +349,165 @@ class FastMCPServer(DurableObject):
         self.env = env
         self.app = setup_server()
 
-    async def on_fetch(self, request, env, ctx):
-        # 直接使用 Starlette 应用处理请求，避免使用有问题的 ASGI 适配器
+    async def fetch(self, request):
+        """Durable Object 的 fetch 方法"""
         try:
-            # 创建一个简单的 ASGI 适配器来处理 Cloudflare Workers 请求
-            from starlette.responses import Response
+            # 解析请求路径
+            from urllib.parse import urlparse
+            parsed_url = urlparse(request.url) 
+            path = parsed_url.path
             
-            # 构建 ASGI scope
-            method = request.method
-            path = request.url.split('?')[0].split('/', 3)[-1] if '/' in request.url else '/'
-            if not path.startswith('/'):
-                path = '/' + path
-            
-            query_string = request.url.split('?', 1)[1] if '?' in request.url else ''
-            
-            # 处理请求头 - 修复原始错误
-            headers = []
-            if hasattr(request, 'headers') and request.headers:
-                for key, value in request.headers.items():
-                    headers.append([key.lower().encode('latin-1'), value.encode('latin-1')])
-            
-            scope = {
-                'type': 'http',
-                'method': method,
-                'path': path,
-                'query_string': query_string.encode('latin-1'),
-                'headers': headers,
-            }
-            
-            # 读取请求体
-            body = b''
-            if method in ['POST', 'PUT', 'PATCH']:
-                body_text = await request.text()
-                body = body_text.encode('utf-8')
-            
-            # ASGI receive callable
-            async def receive():
-                return {
-                    'type': 'http.request',
-                    'body': body,
-                    'more_body': False,
+            # 简化的路由处理
+            if path == "/" or path == "":
+                response_data = {
+                    "name": "Python Code Executor MCP Server",
+                    "version": "1.0.0",
+                    "description": "Execute Python code via MCP protocol with streaming support",
+                    "endpoints": {
+                        "tools": "/tools",
+                        "call_tool": "/tools/call",
+                        "stream_execute": "/stream/execute",
+                        "persistent_stream": "/stream/persistent"
+                    },
+                    "streaming_formats": [
+                        "application/x-ndjson",
+                        "application/json-stream"
+                    ]
                 }
-            
-            # ASGI send callable 和响应收集
-            response_started = False
-            response_status = 200
-            response_headers = []
-            response_body = b''
-            
-            async def send(message):
-                nonlocal response_started, response_status, response_headers, response_body
                 
-                if message['type'] == 'http.response.start':
-                    response_started = True
-                    response_status = message['status']
-                    response_headers = message.get('headers', [])
-                elif message['type'] == 'http.response.body':
-                    response_body += message.get('body', b'')
+            elif path == "/tools":
+                response_data = {
+                    "tools": [
+                        {
+                            "name": "execute_python",
+                            "description": "Execute Python code and return the result",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "code": {
+                                        "type": "string",
+                                        "description": "Python code to execute"
+                                    },
+                                    "stream": {
+                                        "type": "boolean", 
+                                        "description": "Whether to stream the response",
+                                        "default": False
+                                    }
+                                },
+                                "required": ["code"]
+                            }
+                        }
+                    ]
+                }
+                
+            elif path == "/tools/call" and request.method == "POST":
+                # 处理工具调用
+                body = await request.json()
+                tool_name = body.get("name")
+                args = body.get("arguments", {})
+                
+                if tool_name == "execute_python":
+                    code = args.get("code", "")
+                    
+                    if not code:
+                        response_data = {
+                            "content": [{"type": "text", "text": "Error: No code provided"}]
+                        }
+                        status = 400
+                    else:
+                        # 执行 Python 代码
+                        from io import StringIO
+                        from contextlib import redirect_stdout, redirect_stderr
+                        
+                        stdout_capture = StringIO()
+                        stderr_capture = StringIO()
+                        
+                        try:
+                            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+                                exec_globals = {
+                                    '__builtins__': {
+                                        'print': print,
+                                        'len': len,
+                                        'str': str,
+                                        'int': int,
+                                        'float': float,
+                                        'list': list,
+                                        'dict': dict,
+                                        'tuple': tuple,
+                                        'set': set,
+                                        'range': range,
+                                        'enumerate': enumerate,
+                                        'zip': zip,
+                                        'sum': sum,
+                                        'max': max,
+                                        'min': min,
+                                        'abs': abs,
+                                        'round': round,
+                                        'sorted': sorted,
+                                        'reversed': reversed,
+                                        'type': type,
+                                        'isinstance': isinstance,
+                                        'hasattr': hasattr,
+                                        'getattr': getattr,
+                                        'setattr': setattr,
+                                        'bool': bool,
+                                    }
+                                }
+                                
+                                exec(code, exec_globals)
+                                
+                            # 格式化输出
+                            output_parts = []
+                            stdout_content = stdout_capture.getvalue()
+                            stderr_content = stderr_capture.getvalue()
+                            
+                            if stdout_content:
+                                output_parts.append(f"Output:\n{stdout_content}")
+                            if stderr_content:
+                                output_parts.append(f"Errors:\n{stderr_content}")
+                            
+                            if not output_parts:
+                                output_parts.append("Code executed successfully with no output.")
+                            
+                            response_text = "\n\n".join(output_parts)
+                            
+                            response_data = {
+                                "content": [{"type": "text", "text": response_text}]
+                            }
+                            status = 200
+                            
+                        except Exception as e:
+                            stderr_content = stderr_capture.getvalue()
+                            error_parts = []
+                            
+                            if stderr_content:
+                                error_parts.append(f"Errors:\n{stderr_content}")
+                            
+                            error_parts.append(f"Exception:\n{type(e).__name__}: {str(e)}\n{traceback.format_exc()}")
+                            
+                            response_text = "\n\n".join(error_parts)
+                            
+                            response_data = {
+                                "content": [{"type": "text", "text": response_text}]
+                            }
+                            status = 200  # MCP 通常返回 200，错误信息在内容中
+                else:
+                    response_data = {"error": "Tool not found"}
+                    status = 404
+            else:
+                response_data = {"error": "Not found"}
+                status = 404
             
-            # 调用 Starlette 应用
-            await self.app(scope, receive, send)
-            
-            # 构建响应
-            headers_dict = {}
-            for header_pair in response_headers:
-                key = header_pair[0].decode('latin-1')
-                value = header_pair[1].decode('latin-1')
-                headers_dict[key] = value
-            
+            # 使用 Cloudflare Workers 原生 Response
             return Response(
-                content=response_body,
-                status_code=response_status,
-                headers=headers_dict
+                json.dumps(response_data),
+                status=status,
+                headers={
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                }
             )
             
         except Exception as e:
@@ -430,9 +517,12 @@ class FastMCPServer(DurableObject):
                 "traceback": traceback.format_exc()
             }
             return Response(
-                content=json.dumps(error_response),
-                status_code=500,
-                headers={"content-type": "application/json"}
+                json.dumps(error_response),
+                status=500,
+                headers={
+                    "Content-Type": "application/json",
+                    "Access-Control-Allow-Origin": "*",
+                }
             )
 
 
