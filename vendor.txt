@@ -1,2 +1,2 @@
-mcp
-structlog
+starlette
+pydantic-core
