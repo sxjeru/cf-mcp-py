@@ -350,8 +350,90 @@ class FastMCPServer(DurableObject):
         self.app = setup_server()
 
     async def on_fetch(self, request, env, ctx):
-        import asgi
-        return await asgi.fetch(self.app, request, self.env, self.ctx)
+        # 直接使用 Starlette 应用处理请求，避免使用有问题的 ASGI 适配器
+        try:
+            # 创建一个简单的 ASGI 适配器来处理 Cloudflare Workers 请求
+            from starlette.responses import Response
+            
+            # 构建 ASGI scope
+            method = request.method
+            path = request.url.split('?')[0].split('/', 3)[-1] if '/' in request.url else '/'
+            if not path.startswith('/'):
+                path = '/' + path
+            
+            query_string = request.url.split('?', 1)[1] if '?' in request.url else ''
+            
+            # 处理请求头 - 修复原始错误
+            headers = []
+            if hasattr(request, 'headers') and request.headers:
+                for key, value in request.headers.items():
+                    headers.append([key.lower().encode('latin-1'), value.encode('latin-1')])
+            
+            scope = {
+                'type': 'http',
+                'method': method,
+                'path': path,
+                'query_string': query_string.encode('latin-1'),
+                'headers': headers,
+            }
+            
+            # 读取请求体
+            body = b''
+            if method in ['POST', 'PUT', 'PATCH']:
+                body_text = await request.text()
+                body = body_text.encode('utf-8')
+            
+            # ASGI receive callable
+            async def receive():
+                return {
+                    'type': 'http.request',
+                    'body': body,
+                    'more_body': False,
+                }
+            
+            # ASGI send callable 和响应收集
+            response_started = False
+            response_status = 200
+            response_headers = []
+            response_body = b''
+            
+            async def send(message):
+                nonlocal response_started, response_status, response_headers, response_body
+                
+                if message['type'] == 'http.response.start':
+                    response_started = True
+                    response_status = message['status']
+                    response_headers = message.get('headers', [])
+                elif message['type'] == 'http.response.body':
+                    response_body += message.get('body', b'')
+            
+            # 调用 Starlette 应用
+            await self.app(scope, receive, send)
+            
+            # 构建响应
+            headers_dict = {}
+            for header_pair in response_headers:
+                key = header_pair[0].decode('latin-1')
+                value = header_pair[1].decode('latin-1')
+                headers_dict[key] = value
+            
+            return Response(
+                content=response_body,
+                status_code=response_status,
+                headers=headers_dict
+            )
+            
+        except Exception as e:
+            # 错误处理
+            error_response = {
+                "error": f"Internal server error: {str(e)}",
+                "traceback": traceback.format_exc()
+            }
+            return Response(
+                content=json.dumps(error_response),
+                status_code=500,
+                headers={"content-type": "application/json"}
+            )
 
 
 async def on_fetch(request, env):
